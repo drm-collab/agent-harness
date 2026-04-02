@@ -113,6 +113,61 @@ A thread should move from active to closed when:
 
 Closed threads still matter. They provide history and prevent the same work from being reopened accidentally.
 
+## Session recovery
+
+Thread state files handle planned handoffs. Session recovery handles the unplanned ones: context window full, server restart, crash, or compaction.
+
+Recovery uses two layers that serve different purposes.
+
+### Layer 1: Recovery briefing
+
+A fast, cheap model generates a structured summary from the recent transcript. The summary follows a fixed format:
+
+- **Task** — one line describing what was being worked on
+- **Intent** — why the user is doing this and what they will do with the output. This is the most commonly lost signal in naive recovery systems. Without intent, the agent knows the task but not the goal.
+- **Status** — in-progress, completed, blocked, or idle
+- **Last Action** — what was happening right before the reset
+- **Pending** — specific, actionable next steps. Not vague ("user to decide later") but concrete ("user needs to review the 606 session summaries and decide which to feed into redigest")
+- **Key Decisions** — choices made during the conversation that should persist
+- **Guidance** — tagged directives extracted from the conversation:
+  - `[enforce]` — things that must be done a specific way
+  - `[avoid]` — things that failed or were rejected
+  - `[correction]` — user corrections to agent mistakes
+  - `[decision]` — choices that should persist
+  - `[pending]` — unresolved items requiring follow-up
+
+The briefing generator must never include raw JSON, tool results, or API responses. Everything is distilled to plain English. A guidance item that says `[correction] {"tool_use_id": "toolu_01..."}` is worthless. One that says `[correction] price data must come from Tradier, not Alpaca` changes behavior.
+
+Use a fallback chain for generation. The primary model should be fast and cheap (Grok, Haiku). If that fails, fall back to a local model (Ollama). If that also fails, the transcript tail alone still provides continuity.
+
+### Layer 2: Prior session transcript
+
+The raw tail of the conversation (~1500 characters), pulled directly from the database or transcript files. This is not a summary. It is the literal last exchange before the reset.
+
+The transcript tail serves a different purpose than the briefing. The briefing gives topic orientation — what the project is about. The transcript tail gives moment-of-pause precision — exactly where the conversation stopped, what was just said, what was about to happen next.
+
+Together, the two layers are complementary. The agent reads the briefing to understand the project. It reads the transcript tail to pick up the thread.
+
+### Recovery injection
+
+Both layers are assembled into a single recovery block and injected into the next message as a system-level context injection. The agent sees:
+
+1. The structured briefing
+2. The raw transcript tail in a fenced block
+3. An instruction to continue from where the conversation left off
+
+After injection, the recovery block is consumed (removed from the queue). It fires exactly once per reset event.
+
+### When recovery fires
+
+Recovery is triggered by three events:
+
+- **Server restart** — the most recent active chat gets a recovery block generated during startup
+- **Auto-compaction** — when cumulative tokens exceed a threshold, the system compacts and generates recovery
+- **On-demand** — when a chat receives a message after an idle period with no active session
+
+In all three cases, the same two-layer block is generated and injected.
+
 ## Success criteria
 
 Continuity is working when:
@@ -121,3 +176,6 @@ Continuity is working when:
 - the user does not need to repeat recently active context
 - a delegated subtask can return without losing the parent thread
 - channel changes do not split the same work into multiple conflicting threads
+- a server restart or compaction does not lose the current task, intent, or pending actions
+- the recovery briefing contains intent and specific next steps, not vague summaries
+- the transcript tail picks up the exact moment of pause, not a generic project description
